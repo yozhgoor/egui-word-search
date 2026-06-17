@@ -1,18 +1,191 @@
+use std::collections::HashSet;
 use std::fmt;
 
-/// Placement direction. Each variant maps to a (row_delta, col_delta).
+/// Configuration for puzzle generation.
 ///
-/// Cardinal:
-/// - `N`: (-1, 0)  — bottom to top (vertical backward)
-/// - `S`: (1, 0)   — top to bottom (vertical)
-/// - `E`: (0, 1)   — left to right (horizontal)
-/// - `W`: (0, -1)  — right to left (horizontal backward)
-///
-/// Intercardinal:
-/// - `NE`: (-1, 1) — bottom-left to top-right (diagonal backward)
-/// - `NW`: (-1, -1) — bottom-right to top-left (diagonal backward)
-/// - `SE`: (1, 1)  — top-left to bottom-right (diagonal)
-/// - `SW`: (1, -1) — top-right to bottom-left (diagonal backward)
+/// `word_count` visible words are randomly selected from `word_dictionary`.
+/// One hidden word is randomly selected from `solution_dictionary`.
+/// Grid dimensions are computed based on `orientation` and the total
+/// character count of all visible words plus the hidden word.
+#[derive(Debug, Clone)]
+pub struct PuzzleConfig {
+    pub word_dictionary: Vec<String>,
+    pub solution_dictionary: Vec<HiddenWord>,
+    pub word_count: usize,
+    pub orientation: Orientation,
+    pub directions: DirectionConfig,
+    pub max_word_attempts: usize,
+    pub max_grid_attempts: usize,
+}
+
+impl PuzzleConfig {
+    /// Generates a word search puzzle.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The solution or word dictionary is empty.
+    /// - `word_count` is 0 or exceeds the word dictionary size.
+    /// - No directions are enabled.
+    /// - Any word (visible or hidden) is empty or whitespace-only.
+    /// - A valid grid cannot be generated within the configured attempt limit.
+    pub fn generate(&self) -> Result<Puzzle, PuzzleError> {
+        if self.solution_dictionary.is_empty() {
+            return Err(PuzzleError::NoSolutionWords);
+        }
+        if self.word_dictionary.is_empty() {
+            return Err(PuzzleError::EmptyWordDictionary);
+        }
+        if self.word_count == 0 || self.word_count > self.word_dictionary.len() {
+            return Err(PuzzleError::InvalidWordCount);
+        }
+
+        let directions = self.directions.to_directions();
+        if directions.is_empty() {
+            return Err(PuzzleError::NoDirections);
+        }
+
+        for hw in &self.solution_dictionary {
+            if hw.word.trim().is_empty() {
+                return Err(PuzzleError::EmptyWord {
+                    word: hw.word.clone(),
+                });
+            }
+        }
+        for word in &self.word_dictionary {
+            if word.trim().is_empty() {
+                return Err(PuzzleError::EmptyWord { word: word.clone() });
+            }
+        }
+
+        for _ in 0..self.max_grid_attempts {
+            let hidden_idx = fastrand::usize(0..self.solution_dictionary.len());
+            let selected = &self.solution_dictionary[hidden_idx];
+            let hidden_upper = selected.word.to_uppercase();
+
+            let visible =
+                select_visible_words(&self.word_dictionary, self.word_count, &hidden_upper);
+            if visible.len() < self.word_count {
+                continue;
+            }
+
+            let visible_chars: usize = visible.iter().map(|w| w.len()).sum();
+            let total = visible_chars + hidden_upper.len();
+            let longest = visible.iter().map(|w| w.len()).max().unwrap();
+
+            let (width, height) = compute_grid_size(total, longest, &directions, self.orientation);
+
+            let mut grid = vec![vec!['\0'; width]; height];
+            let mut placements = Vec::new();
+            let mut all_placed = true;
+
+            let mut sorted: Vec<&String> = visible.iter().collect();
+            sorted.sort_by_key(|b| std::cmp::Reverse(b.len()));
+
+            for word in &sorted {
+                let chars: Vec<char> = word.to_uppercase().chars().collect();
+                let len = chars.len();
+                let mut placed = false;
+
+                let mut dir_shuffle: Vec<&Direction> = directions.iter().collect();
+                fastrand::shuffle(&mut dir_shuffle);
+
+                for dir in dir_shuffle {
+                    let (dr, dc) = dir.delta();
+
+                    let (min_row, max_row) = direction_bounds(len, height - 1, dr);
+                    if min_row > max_row {
+                        continue;
+                    }
+                    let (min_col, max_col) = direction_bounds(len, width - 1, dc);
+                    if min_col > max_col {
+                        continue;
+                    }
+
+                    for _ in 0..self.max_word_attempts.max(1).div_ceil(directions.len()) {
+                        let start_row = fastrand::usize(min_row..=max_row);
+                        let start_col = fastrand::usize(min_col..=max_col);
+
+                        let mut fits = true;
+                        for ((r, c), &ch) in
+                            positions(start_row, start_col, dr, dc, len).zip(chars.iter())
+                        {
+                            let cell = grid[r][c];
+                            if cell != '\0' && cell != ch {
+                                fits = false;
+                                break;
+                            }
+                        }
+
+                        if fits {
+                            for ((r, c), &ch) in
+                                positions(start_row, start_col, dr, dc, len).zip(chars.iter())
+                            {
+                                grid[r][c] = ch;
+                            }
+                            placements.push(WordPlacement {
+                                word: (*word).clone(),
+                                row: start_row,
+                                col: start_col,
+                                direction: *dir,
+                            });
+                            placed = true;
+                            break;
+                        }
+                    }
+
+                    if placed {
+                        break;
+                    }
+                }
+
+                if !placed {
+                    all_placed = false;
+                    break;
+                }
+            }
+
+            if all_placed {
+                let empty_count = grid.iter().flatten().filter(|&&c| c == '\0').count();
+
+                if empty_count == hidden_upper.chars().count() {
+                    fill_scrambled(&mut grid, &hidden_upper);
+
+                    return Ok(Puzzle {
+                        grid,
+                        placements,
+                        hidden_word: HiddenWord {
+                            word: selected.word.clone(),
+                            hint: selected.hint.clone(),
+                        },
+                    });
+                }
+            }
+        }
+
+        Err(PuzzleError::PlacementFailed)
+    }
+}
+
+/// A generated word search puzzle.
+#[derive(Debug, Clone)]
+pub struct Puzzle {
+    pub grid: Vec<Vec<char>>,
+    pub placements: Vec<WordPlacement>,
+    pub hidden_word: HiddenWord,
+}
+
+impl Puzzle {
+    pub fn words(&self) -> Vec<&str> {
+        self.placements.iter().map(|p| p.word.as_str()).collect()
+    }
+
+    pub fn dimensions(&self) -> (usize, usize) {
+        (self.grid.len(), self.grid.first().map_or(0, |r| r.len()))
+    }
+}
+
+/// Placement direction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Direction {
     N,
@@ -51,27 +224,59 @@ impl Direction {
             Direction::NW,
         ]
     }
+}
 
-    pub fn has_horizontal(&self) -> bool {
-        matches!(
-            self,
-            Self::E | Self::W | Self::NE | Self::NW | Self::SE | Self::SW
-        )
-    }
+/// Which word directions are allowed.
+#[derive(Debug, Clone)]
+pub struct DirectionConfig {
+    pub horizontally: bool,
+    pub vertically: bool,
+    pub diagonally: bool,
+    pub backward: bool,
+}
 
-    pub fn has_vertical(&self) -> bool {
-        matches!(
-            self,
-            Self::N | Self::S | Self::NE | Self::NW | Self::SE | Self::SW
-        )
+impl DirectionConfig {
+    /// Resolve the set of enabled [`Direction`] variants.
+    ///
+    /// Mapping:
+    /// - `horizontally` → `E`
+    /// - `vertically` → `S`
+    /// - `diagonally` → `SE`, `SW`
+    /// - `backward` → adds `W` (reverse of E), `N` (reverse of S),
+    ///   `NW` (reverse of SE), `NE` (reverse of SW)
+    ///   for each respective forward direction that is enabled.
+    pub fn to_directions(&self) -> Vec<Direction> {
+        let mut dirs = Vec::new();
+        if self.horizontally {
+            dirs.push(Direction::E);
+            if self.backward {
+                dirs.push(Direction::W);
+            }
+        }
+        if self.vertically {
+            dirs.push(Direction::S);
+            if self.backward {
+                dirs.push(Direction::N);
+            }
+        }
+        if self.diagonally {
+            dirs.push(Direction::SE);
+            dirs.push(Direction::SW);
+            if self.backward {
+                dirs.push(Direction::NW);
+                dirs.push(Direction::NE);
+            }
+        }
+        dirs
     }
 }
 
-/// Dimensions for manual grid sizing.
-#[derive(Debug, Clone)]
-pub struct GridSize {
-    pub width: usize,
-    pub height: usize,
+/// Grid shape preference.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Orientation {
+    Square,
+    Landscape,
+    Portrait,
 }
 
 /// A hidden word candidate with an accompanying hint.
@@ -79,24 +284,6 @@ pub struct GridSize {
 pub struct HiddenWord {
     pub word: String,
     pub hint: String,
-}
-
-/// Configuration for puzzle generation.
-///
-/// `size` controls the grid dimensions:
-/// - `None` — auto-calculated to fit all visible words plus the selected hidden word
-/// - `Some(GridSize)` — uses the provided dimensions; validation ensures enough cells
-///
-/// `max_word_attempts` controls how many random placements are tried per word before giving up
-/// on the current grid. `max_grid_attempts` controls how many times the entire grid is retried
-/// when a word cannot be placed.
-#[derive(Debug, Clone)]
-pub struct PuzzleConfig {
-    pub size: Option<GridSize>,
-    pub directions: Vec<Direction>,
-    pub max_word_attempts: usize,
-    pub max_grid_attempts: usize,
-    pub hidden_words: Vec<HiddenWord>,
 }
 
 /// A placed word and its position within the grid.
@@ -108,251 +295,128 @@ pub struct WordPlacement {
     pub direction: Direction,
 }
 
-/// A generated word search puzzle.
-#[derive(Debug, Clone)]
-pub struct Puzzle {
-    pub grid: Vec<Vec<char>>,
-    pub placements: Vec<WordPlacement>,
-    pub hidden_word: HiddenWord,
-}
+fn select_visible_words(dictionary: &[String], count: usize, hidden: &str) -> Vec<String> {
+    let mut candidates: Vec<&String> = dictionary
+        .iter()
+        .filter(|w| w.to_uppercase() != hidden)
+        .collect();
 
-impl Puzzle {
-    pub fn words(&self) -> Vec<&str> {
-        self.placements.iter().map(|p| p.word.as_str()).collect()
+    if candidates.is_empty() {
+        return Vec::new();
     }
 
-    pub fn dimensions(&self) -> (usize, usize) {
-        (self.grid.len(), self.grid.first().map_or(0, |r| r.len()))
-    }
-}
+    fastrand::shuffle(&mut candidates);
+    let mut selected = Vec::new();
+    let mut seen = HashSet::new();
 
-/// Generates a word search puzzle.
-///
-/// Places each visible word in a grid using the allowed directions, then fills
-/// remaining cells with the selected hidden word's letters (left-to-right,
-/// top-to-bottom). If any word cannot be placed, the entire grid is retried
-/// up to `max_grid_attempts` times before returning an error.
-///
-/// # Errors
-///
-/// Returns an error if:
-/// - The hidden words list is empty.
-/// - Any word (visible or hidden) is empty or whitespace-only.
-/// - No valid visible words remain after filtering (hidden word excluded, duplicates removed).
-/// - A manual grid is too small to fit all words.
-/// - No directions are specified.
-pub fn generate(words: &[String], config: &PuzzleConfig) -> Result<Puzzle, PuzzleError> {
-    if config.hidden_words.is_empty() {
-        return Err(PuzzleError::NoHiddenWords);
-    }
-
-    if config.directions.is_empty() {
-        return Err(PuzzleError::NoDirections);
-    }
-
-    for hw in &config.hidden_words {
-        if hw.word.trim().is_empty() {
-            return Err(PuzzleError::EmptyWord {
-                word: hw.word.clone(),
-            });
-        }
-    }
-
-    for word in words {
-        if word.trim().is_empty() {
-            return Err(PuzzleError::EmptyWord { word: word.clone() });
-        }
-    }
-
-    let hidden_idx = fastrand::usize(0..config.hidden_words.len());
-    let selected = &config.hidden_words[hidden_idx];
-    let hidden_upper = selected.word.to_uppercase();
-
-    let visible = {
-        let mut seen = std::collections::HashSet::new();
-        words
-            .iter()
-            .filter(|w| {
-                let upper = w.to_uppercase();
-                upper != hidden_upper && seen.insert(upper)
-            })
-            .collect::<Vec<&String>>()
-    };
-
-    if visible.is_empty() {
-        return Err(PuzzleError::EmptyWordList);
-    }
-
-    let total_visible: usize = visible.iter().map(|w| w.chars().count()).sum();
-    let total = total_visible + hidden_upper.chars().count();
-
-    let longest = visible.iter().map(|w| w.chars().count()).max().unwrap();
-    let (min_width, min_height) = compute_min_bounds(longest, &config.directions);
-
-    let (width, height) = match &config.size {
-        Some(g) => {
-            if g.width * g.height < total {
-                return Err(PuzzleError::InvalidGridSize);
-            }
-            (g.width, g.height)
-        }
-        None => compute_grid_size(total, min_width, min_height),
-    };
-
-    for _ in 0..config.max_grid_attempts {
-        let mut grid = vec![vec!['\0'; width]; height];
-        let mut placements = Vec::new();
-        let mut all_placed = true;
-
-        let mut indices: Vec<usize> = (0..visible.len()).collect();
-        indices.sort_by(|&a, &b| visible[b].chars().count().cmp(&visible[a].chars().count()));
-
-        for &idx in &indices {
-            let word = visible[idx];
-            let chars: Vec<char> = word.to_uppercase().chars().collect();
-            let len = chars.len();
-
-            let mut placed = false;
-
-            for _ in 0..config.max_word_attempts {
-                let dir_idx = fastrand::usize(0..config.directions.len());
-                let dir = config.directions[dir_idx];
-                let (dr, dc) = dir.delta();
-
-                let row_fits = if dr != 0 { height >= len } else { true };
-                let col_fits = if dc != 0 { width >= len } else { true };
-                if !row_fits || !col_fits {
-                    continue;
-                }
-
-                let (min_row, max_row) = direction_bounds(len, height - 1, dr);
-                if min_row > max_row {
-                    continue;
-                }
-
-                let (min_col, max_col) = direction_bounds(len, width - 1, dc);
-                if min_col > max_col {
-                    continue;
-                }
-
-                let start_row = fastrand::usize(min_row..=max_row);
-                let start_col = fastrand::usize(min_col..=max_col);
-
-                let mut fits = true;
-                for ((r, c), &_ch) in positions(start_row, start_col, dr, dc, len).zip(chars.iter())
-                {
-                    let cell = grid[r][c];
-                    if cell != '\0' {
-                        fits = false;
-                        break;
-                    }
-                }
-
-                if fits {
-                    for ((r, c), &ch) in
-                        positions(start_row, start_col, dr, dc, len).zip(chars.iter())
-                    {
-                        grid[r][c] = ch;
-                    }
-                    placements.push(WordPlacement {
-                        word: word.clone(),
-                        row: start_row,
-                        col: start_col,
-                        direction: dir,
-                    });
-                    placed = true;
-                    break;
-                }
-            }
-
-            if !placed {
-                all_placed = false;
+    for word in candidates {
+        if seen.insert(word.to_uppercase()) {
+            selected.push(word.clone());
+            if selected.len() == count {
                 break;
             }
         }
+    }
 
-        if all_placed {
-            let hidden_chars: Vec<char> = hidden_upper.chars().collect();
-            let mut hid_idx = 0;
-            for row in grid.iter_mut() {
-                for cell in row.iter_mut() {
-                    if *cell == '\0' {
-                        *cell = hidden_chars[hid_idx % hidden_chars.len()];
-                        hid_idx += 1;
+    selected
+}
+
+fn compute_grid_size(
+    total: usize,
+    longest: usize,
+    directions: &[Direction],
+    orientation: Orientation,
+) -> (usize, usize) {
+    let needs_width = directions.iter().any(|d| d.delta().1 != 0);
+    let needs_height = directions.iter().any(|d| d.delta().0 != 0);
+    let has_diagonal = directions
+        .iter()
+        .any(|d| d.delta().0 != 0 && d.delta().1 != 0);
+    let has_non_diagonal = directions
+        .iter()
+        .any(|d| d.delta().0 == 0 || d.delta().1 == 0);
+
+    let only_horizontal = needs_width && !needs_height && !has_diagonal;
+    let only_vertical = !needs_width && needs_height && !has_diagonal;
+    let only_diagonal = !has_non_diagonal && has_diagonal;
+
+    let dim_ok = |wi: usize, hi: usize| -> bool {
+        if only_horizontal && wi < longest {
+            return false;
+        }
+        if only_vertical && hi < longest {
+            return false;
+        }
+        if only_diagonal && (wi < longest || hi < longest) {
+            return false;
+        }
+        if !only_horizontal && !only_vertical && !only_diagonal && wi < longest && hi < longest {
+            return false;
+        }
+        true
+    };
+
+    let orient_ok = |wi: usize, hi: usize| -> bool {
+        matches!(
+            (orientation, wi >= hi),
+            (Orientation::Landscape, true)
+                | (Orientation::Portrait, false)
+                | (Orientation::Square, _)
+        )
+    };
+
+    let weight = |wi: usize, hi: usize| -> usize { wi.abs_diff(hi) };
+    let max_pad = longest.max(3);
+    let mut candidates = Vec::new();
+
+    for pad in 0..=max_pad {
+        let target = total + pad;
+        let limit = (target as f64).sqrt() as usize;
+        for w in 1..=limit {
+            if target.is_multiple_of(w) {
+                let h = target / w;
+                for &(wi, hi) in &[(w, h), (h, w)] {
+                    if dim_ok(wi, hi) {
+                        candidates.push((wi, hi, pad));
                     }
                 }
             }
-
-            return Ok(Puzzle {
-                grid,
-                placements,
-                hidden_word: HiddenWord {
-                    word: selected.word.clone(),
-                    hint: selected.hint.clone(),
-                },
-            });
         }
     }
 
-    Err(PuzzleError::PlacementFailed)
-}
+    candidates.sort_by(|&(wi1, hi1, pad1), &(wi2, hi2, pad2)| {
+        pad1.cmp(&pad2)
+            .then_with(|| {
+                let w1 = weight(wi1, hi1);
+                let w2 = weight(wi2, hi2);
+                w1.cmp(&w2)
+            })
+            .then_with(|| {
+                let o1 = orient_ok(wi1, hi1);
+                let o2 = orient_ok(wi2, hi2);
+                o2.cmp(&o1)
+            })
+    });
 
-fn compute_min_bounds(longest_word: usize, directions: &[Direction]) -> (usize, usize) {
-    let has_h = directions.iter().any(|d| d.has_horizontal());
-    let has_v = directions.iter().any(|d| d.has_vertical());
-    let min_w = if has_h { longest_word } else { 1 };
-    let min_h = if has_v { longest_word } else { 1 };
-    (min_w, min_h)
-}
-
-fn compute_grid_size(total: usize, min_width: usize, min_height: usize) -> (usize, usize) {
-    let limit = total.min(10000);
-
-    // First: find exact-fit grids (w * h == total)
-    let mut best_exact = None;
-    let mut best_exact_diff = usize::MAX;
-
-    for w in min_width..=limit {
-        if total.is_multiple_of(w) {
-            let h = total / w;
-            if h >= min_height {
-                let diff = w.abs_diff(h);
-                if diff < best_exact_diff {
-                    best_exact = Some((w, h));
-                    best_exact_diff = diff;
-                }
-            }
-        }
+    if let Some(&(w, h, _)) = candidates.first() {
+        return (w, h);
     }
 
-    if let Some(g) = best_exact {
-        return g;
-    }
-
-    // Fallback: minimal-padding grid
-    let mut best = (1, total);
-    let mut best_padding = usize::MAX;
-    let mut best_diff = usize::MAX;
-
-    for w in min_width..=limit {
-        let h = total.div_ceil(w).max(min_height);
-        let padding = w * h - total;
-        let diff = w.abs_diff(h);
-
-        if padding < best_padding || (padding == best_padding && diff < best_diff) {
-            best = (w, h);
-            best_padding = padding;
-            best_diff = diff;
-        }
-    }
-
-    best
+    let w = if needs_width { total.max(longest) } else { 1 };
+    let h = if needs_height { total.max(longest) } else { 1 };
+    (w, h)
 }
 
 fn direction_bounds(len: usize, max_idx: usize, delta: isize) -> (usize, usize) {
     if delta > 0 {
+        if len > max_idx + 1 {
+            return (1, 0);
+        }
         (0, max_idx + 1 - len)
     } else if delta < 0 {
+        if len > max_idx + 1 {
+            return (1, 0);
+        }
         (len - 1, max_idx)
     } else {
         (0, max_idx)
@@ -373,31 +437,51 @@ fn positions(
     })
 }
 
+fn fill_scrambled(grid: &mut [Vec<char>], hidden: &str) {
+    let mut chars: Vec<char> = hidden.chars().collect();
+    fastrand::shuffle(&mut chars);
+    let mut idx = 0;
+    for row in grid.iter_mut() {
+        for cell in row.iter_mut() {
+            if *cell == '\0' {
+                *cell = chars[idx];
+                idx += 1;
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum PuzzleError {
-    EmptyWordList,
     PlacementFailed,
     EmptyWord { word: String },
-    NoHiddenWords,
-    InvalidGridSize,
+    NoSolutionWords,
+    EmptyWordDictionary,
+    InvalidWordCount,
     NoDirections,
 }
 
 impl fmt::Display for PuzzleError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            PuzzleError::EmptyWordList => write!(f, "no valid visible words to place"),
             PuzzleError::PlacementFailed => {
                 write!(f, "failed to place all words after all attempts")
             }
             PuzzleError::EmptyWord { word } => {
                 write!(f, "word '{word}' is empty or whitespace-only")
             }
-            PuzzleError::NoHiddenWords => write!(f, "at least one hidden word must be provided"),
-            PuzzleError::InvalidGridSize => write!(
-                f,
-                "manual grid is too small for all visible words and hidden word"
-            ),
+            PuzzleError::NoSolutionWords => {
+                write!(f, "at least one solution word must be provided")
+            }
+            PuzzleError::EmptyWordDictionary => {
+                write!(f, "word dictionary is empty")
+            }
+            PuzzleError::InvalidWordCount => {
+                write!(
+                    f,
+                    "word count must be between 1 and the size of the word dictionary"
+                )
+            }
             PuzzleError::NoDirections => write!(f, "at least one direction must be specified"),
         }
     }
@@ -408,15 +492,32 @@ impl std::error::Error for PuzzleError {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashSet;
+
+    fn words(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn hidden(word: &str, hint: &str) -> Vec<HiddenWord> {
+        vec![HiddenWord {
+            word: word.into(),
+            hint: hint.into(),
+        }]
+    }
 
     fn default_config() -> PuzzleConfig {
         PuzzleConfig {
-            size: None,
-            directions: Direction::all().to_vec(),
+            word_dictionary: vec![],
+            solution_dictionary: vec![],
+            word_count: 0,
+            orientation: Orientation::Square,
+            directions: DirectionConfig {
+                horizontally: true,
+                vertically: true,
+                diagonally: true,
+                backward: true,
+            },
             max_word_attempts: 1000,
             max_grid_attempts: 100,
-            hidden_words: vec![],
         }
     }
 
@@ -456,14 +557,12 @@ mod tests {
                                 break;
                             }
                         }
-
                         if found {
                             continue 'words;
                         }
                     }
                 }
             }
-
             errors.push(word.clone());
         }
 
@@ -476,7 +575,8 @@ mod tests {
         }
 
         let hidden_upper = hidden_word.to_uppercase();
-        let hidden_chars: Vec<char> = hidden_upper.chars().collect();
+        let mut hidden_chars: Vec<char> = hidden_upper.chars().collect();
+        hidden_chars.sort();
         let mut leftover = String::new();
         for row in 0..height {
             for col in 0..width {
@@ -485,18 +585,12 @@ mod tests {
                 }
             }
         }
+        let mut leftover_chars: Vec<char> = leftover.chars().collect();
+        leftover_chars.sort();
 
-        let matches_hidden = hidden_chars.is_empty()
-            || leftover
-                .chars()
-                .enumerate()
-                .all(|(i, c)| c == hidden_chars[i % hidden_chars.len()]);
-
-        if !matches_hidden {
-            let truncated: String = leftover.chars().take(20).collect();
+        if leftover_chars != hidden_chars {
             errors.push(format!(
-                "hidden word mismatch: leftover starts with '{}', expected pattern '{}'",
-                truncated, hidden_upper
+                "hidden word mismatch: leftover '{leftover}' does not match '{hidden_upper}'"
             ));
         }
 
@@ -510,327 +604,287 @@ mod tests {
     #[test]
     fn basic_generation() {
         let config = PuzzleConfig {
-            hidden_words: vec![HiddenWord {
-                word: "fire".into(),
-                hint: "element".into(),
-            }],
+            word_dictionary: words(&["rust", "python", "java", "go", "c"]),
+            solution_dictionary: hidden("fire", "element"),
+            word_count: 3,
             ..default_config()
         };
-        let words = vec!["rust".into(), "python".into(), "java".into()];
-        let puzzle = generate(&words, &config).unwrap();
-
-        assert_eq!(puzzle.hidden_word.word, "fire");
+        let puzzle = config.generate().unwrap();
         assert_eq!(puzzle.hidden_word.hint, "element");
         assert_eq!(puzzle.placements.len(), 3);
-        assert!(puzzle.words().contains(&"rust"));
-        assert!(puzzle.words().contains(&"python"));
-        assert!(puzzle.words().contains(&"java"));
+        assert!(!puzzle.words().contains(&"fire"));
 
         let (h, w) = puzzle.dimensions();
-        let total_visible: usize = words.iter().map(|word| word.chars().count()).sum();
+        let total_visible: usize = puzzle.words().iter().map(|w| w.len()).sum();
         let total = total_visible + "fire".len();
         assert!(
             h * w >= total,
-            "grid must fit at least {} cells, got {}",
-            total,
+            "grid must fit at least {total} cells, got {}",
             h * w
         );
 
+        let words: Vec<String> = puzzle.words().iter().map(|&s| s.to_string()).collect();
         assert!(solve(&puzzle.grid, &puzzle.placements, &words, "fire").is_ok());
     }
 
     #[test]
-    fn solver_detects_corrupted_visible() {
+    fn exact_cell_count() {
         let config = PuzzleConfig {
-            hidden_words: vec![HiddenWord {
-                word: "fire".into(),
-                hint: "element".into(),
-            }],
+            word_dictionary: words(&["abc", "def", "ghi", "jkl"]),
+            solution_dictionary: hidden("xy", "test"),
+            word_count: 3,
             ..default_config()
         };
-        let words = vec!["rust".into(), "python".into()];
-        let puzzle = generate(&words, &config).unwrap();
-
-        let mut corrupted = puzzle.grid.clone();
-        for p in &puzzle.placements {
-            let (dr, dc) = p.direction.delta();
-            for (r, c) in positions(p.row, p.col, dr, dc, p.word.chars().count()) {
-                corrupted[r][c] = 'X';
-            }
-        }
-
-        let result = solve(&corrupted, &puzzle.placements, &words, "fire");
-        assert!(result.is_err());
+        let puzzle = config.generate().unwrap();
+        let (h, w) = puzzle.dimensions();
+        let cells_used: usize = puzzle.placements.iter().map(|p| p.word.len()).sum();
+        let hidden_len = puzzle.hidden_word.word.len();
+        assert_eq!(h * w - cells_used, hidden_len);
     }
 
     #[test]
-    fn solver_detects_corrupted_hidden() {
+    fn leftover_is_scrambled_hidden_word() {
         let config = PuzzleConfig {
-            hidden_words: vec![HiddenWord {
-                word: "fire".into(),
-                hint: "element".into(),
-            }],
+            word_dictionary: words(&["abc", "def", "ghi"]),
+            solution_dictionary: hidden("xy", "test"),
+            word_count: 2,
             ..default_config()
         };
-        let words = vec!["rust".into()];
-        let puzzle = generate(&words, &config).unwrap();
-
-        let height = puzzle.grid.len();
-        let width = puzzle.grid[0].len();
-        let mut used = vec![vec![false; width]; height];
+        let puzzle = config.generate().unwrap();
+        let (h, w) = puzzle.dimensions();
+        let mut used = vec![vec![false; w]; h];
         for p in &puzzle.placements {
             let (dr, dc) = p.direction.delta();
             for (r, c) in positions(p.row, p.col, dr, dc, p.word.chars().count()) {
                 used[r][c] = true;
             }
         }
+        let leftover: String = (0..h)
+            .flat_map(|r| (0..w).map(move |c| (r, c)))
+            .filter(|&(r, c)| !used[r][c])
+            .map(|(r, c)| puzzle.grid[r][c])
+            .collect();
 
-        let mut corrupted = puzzle.grid.clone();
-        'outer: for r in 0..height {
-            for c in 0..width {
-                if !used[r][c] {
-                    corrupted[r][c] = 'X';
-                    break 'outer;
-                }
-            }
-        }
-
-        let result = solve(&corrupted, &puzzle.placements, &words, "fire");
-        let errors = result.unwrap_err();
-        assert!(errors.iter().any(|e| e.contains("hidden word")));
-    }
-
-    #[test]
-    fn rejects_no_hidden_words() {
-        let config = default_config();
-        let words = vec!["hello".into()];
-        let result = generate(&words, &config);
-        assert!(matches!(result, Err(PuzzleError::NoHiddenWords)));
-    }
-
-    #[test]
-    fn rejects_empty_hidden_word() {
-        let config = PuzzleConfig {
-            hidden_words: vec![HiddenWord {
-                word: "".into(),
-                hint: "empty".into(),
-            }],
-            ..default_config()
-        };
-        let words = vec!["hello".into()];
-        let result = generate(&words, &config);
-        assert!(matches!(result, Err(PuzzleError::EmptyWord { .. })));
-    }
-
-    #[test]
-    fn rejects_empty_visible_word() {
-        let config = PuzzleConfig {
-            hidden_words: vec![HiddenWord {
-                word: "secret".into(),
-                hint: "hidden".into(),
-            }],
-            ..default_config()
-        };
-        let words = vec!["hello".into(), "".into()];
-        let result = generate(&words, &config);
-        assert!(matches!(result, Err(PuzzleError::EmptyWord { .. })));
-    }
-
-    #[test]
-    fn rejects_manual_grid_too_small() {
-        let config = PuzzleConfig {
-            size: Some(GridSize {
-                width: 4,
-                height: 5,
-            }),
-            hidden_words: vec![HiddenWord {
-                word: "secret".into(),
-                hint: "hidden".into(),
-            }],
-            ..default_config()
-        };
-        let words = vec!["hello".into(), "world".into(), "puzzle".into()];
-        let result = generate(&words, &config);
-        assert!(matches!(result, Err(PuzzleError::InvalidGridSize)));
-    }
-
-    #[test]
-    fn duplicate_is_filtered() {
-        let config = PuzzleConfig {
-            hidden_words: vec![HiddenWord {
-                word: "rust".into(),
-                hint: "language".into(),
-            }],
-            ..default_config()
-        };
-        let words = vec!["rust".into(), "python".into(), "java".into()];
-        let puzzle = generate(&words, &config).unwrap();
-        assert_eq!(puzzle.placements.len(), 2);
-        assert!(!puzzle.words().contains(&"rust"));
-    }
-
-    #[test]
-    fn rejects_no_directions() {
-        let config = PuzzleConfig {
-            directions: vec![],
-            hidden_words: vec![HiddenWord {
-                word: "secret".into(),
-                hint: "hidden".into(),
-            }],
-            ..default_config()
-        };
-        let words = vec!["hello".into()];
-        let result = generate(&words, &config);
-        assert!(matches!(result, Err(PuzzleError::NoDirections)));
-    }
-
-    #[test]
-    fn word_method() {
-        let config = PuzzleConfig {
-            hidden_words: vec![HiddenWord {
-                word: "cat".into(),
-                hint: "animal".into(),
-            }],
-            ..default_config()
-        };
-        let words = vec!["dog".into(), "bird".into()];
-        let puzzle = generate(&words, &config).unwrap();
-        let word_list = puzzle.words();
-        assert_eq!(word_list.len(), 2);
-        assert!(word_list.contains(&"dog"));
-        assert!(word_list.contains(&"bird"));
-    }
-
-    #[test]
-    fn auto_size_exact_fit() {
-        let config = PuzzleConfig {
-            hidden_words: vec![HiddenWord {
-                word: "hi".into(),
-                hint: "greeting".into(),
-            }],
-            ..default_config()
-        };
-        let words = vec!["abc".into(), "de".into()];
-        let puzzle = generate(&words, &config).unwrap();
-        let (h, w) = puzzle.dimensions();
-        let total: usize = words.iter().map(|word| word.chars().count()).sum();
-        let expected = total + 2;
-        assert!(
-            h * w >= expected,
-            "grid must fit at least {} cells, got {}",
-            expected,
-            h * w
-        );
+        let hidden_upper = puzzle.hidden_word.word.to_uppercase();
+        let mut lc: Vec<char> = leftover.chars().collect();
+        let mut hc: Vec<char> = hidden_upper.chars().collect();
+        lc.sort();
+        hc.sort();
+        assert_eq!(lc, hc);
     }
 
     #[test]
     fn grid_only_contains_allowed_letters() {
         let config = PuzzleConfig {
-            hidden_words: vec![HiddenWord {
-                word: "fire".into(),
-                hint: "element".into(),
-            }],
+            word_dictionary: words(&["rust", "python", "java", "go", "c"]),
+            solution_dictionary: hidden("fire", "element"),
+            word_count: 3,
             ..default_config()
         };
-        let words = vec!["rust".into(), "python".into(), "java".into()];
-        let puzzle = generate(&words, &config).unwrap();
-
+        let puzzle = config.generate().unwrap();
         let hidden_upper = puzzle.hidden_word.word.to_uppercase();
         let mut allowed: HashSet<char> = hidden_upper.chars().collect();
-        for w in &words {
+        for w in puzzle.words() {
             allowed.extend(w.to_uppercase().chars());
         }
-
         for (r, row) in puzzle.grid.iter().enumerate() {
             for (c, &ch) in row.iter().enumerate() {
                 assert!(
                     allowed.contains(&ch),
-                    "cell ({},{}) contains '{}' which is not in any visible word or the hidden word",
-                    r,
-                    c,
-                    ch
+                    "cell ({r},{c}) has '{ch}' not in any word"
                 );
             }
         }
     }
 
     #[test]
-    fn grid_is_tight_fit() {
-        // 4 words × 3 chars + 2-char hidden = 14 total
-        // min_w = 3, min_h = 3 (from all directions)
-        // 3×5 = 15, padding = 1 < 2
-        let config = PuzzleConfig {
-            hidden_words: vec![HiddenWord {
-                word: "xy".into(),
-                hint: "test".into(),
-            }],
+    fn orientation() {
+        let dict = || words(&["abc", "def", "ghi", "jkl", "mno", "pqr"]);
+
+        let square = PuzzleConfig {
+            word_dictionary: dict(),
+            solution_dictionary: hidden("test", "exam"),
+            word_count: 4,
+            orientation: Orientation::Square,
             ..default_config()
-        };
-        let words = vec!["abc".into(), "def".into(), "ghi".into(), "jkl".into()];
-        let puzzle = generate(&words, &config).unwrap();
+        }
+        .generate()
+        .unwrap();
+        let (h, w) = square.dimensions();
+        assert!(h.abs_diff(w) <= 2, "square: {w}x{h}");
 
-        let (h, w) = puzzle.dimensions();
-        let total_cells = h * w;
-        let hidden_len = puzzle.hidden_word.word.len();
-        let visible_chars: usize = words.iter().map(|w| w.chars().count()).sum();
-        let needed = visible_chars + hidden_len;
-        let padding = total_cells - needed;
+        let landscape = PuzzleConfig {
+            word_dictionary: dict(),
+            solution_dictionary: hidden("xy", "test"),
+            word_count: 4,
+            orientation: Orientation::Landscape,
+            ..default_config()
+        }
+        .generate()
+        .unwrap();
+        let (h, w) = landscape.dimensions();
+        assert!(w >= h, "landscape: {w}x{h}");
 
-        assert!(
-            total_cells >= needed,
-            "grid is too small: {} cells for {} needed",
-            total_cells,
-            needed
-        );
-        assert!(
-            padding < hidden_len,
-            "padding too large: {padding} cells, hidden word is {hidden_len} chars"
-        );
+        let portrait = PuzzleConfig {
+            word_dictionary: dict(),
+            solution_dictionary: hidden("xy", "test"),
+            word_count: 4,
+            orientation: Orientation::Portrait,
+            ..default_config()
+        }
+        .generate()
+        .unwrap();
+        let (h, w) = portrait.dimensions();
+        assert!(h >= w, "portrait: {w}x{h}");
     }
 
     #[test]
-    fn leftover_spells_hidden_word_once() {
-        // 3 words × 3 chars + 2-char hidden = 11 total
-        // min_w = 3, min_h = 3, 3×4 = 12, padding = 1 < 2
-        let config = PuzzleConfig {
-            hidden_words: vec![HiddenWord {
-                word: "xy".into(),
-                hint: "test".into(),
-            }],
+    fn direction_config() {
+        let dict = || words(&["abc", "def", "ghi", "jkl", "mno", "pqr"]);
+
+        let fwd = PuzzleConfig {
+            word_dictionary: dict(),
+            solution_dictionary: hidden("xy", "test"),
+            word_count: 3,
+            directions: DirectionConfig {
+                horizontally: true,
+                vertically: true,
+                diagonally: true,
+                backward: false,
+            },
             ..default_config()
-        };
-        let words = vec!["abc".into(), "def".into(), "ghi".into()];
-        let puzzle = generate(&words, &config).unwrap();
-
-        let height = puzzle.grid.len();
-        let width = puzzle.grid[0].len();
-
-        let mut used = vec![vec![false; width]; height];
-        for p in &puzzle.placements {
-            let (dr, dc) = p.direction.delta();
-            for (r, c) in positions(p.row, p.col, dr, dc, p.word.chars().count()) {
-                used[r][c] = true;
+        }
+        .generate()
+        .unwrap();
+        for p in &fwd.placements {
+            match p.direction {
+                Direction::E | Direction::S | Direction::SE | Direction::SW => {}
+                _ => panic!("backward direction {:?}", p.direction),
             }
         }
 
-        let leftover: String = (0..height)
-            .flat_map(|r| (0..width).map(move |c| (r, c)))
-            .filter(|&(r, c)| !used[r][c])
-            .map(|(r, c)| puzzle.grid[r][c])
-            .collect();
+        let horiz = PuzzleConfig {
+            word_dictionary: dict(),
+            solution_dictionary: hidden("xy", "test"),
+            word_count: 3,
+            directions: DirectionConfig {
+                horizontally: true,
+                vertically: false,
+                diagonally: false,
+                backward: false,
+            },
+            ..default_config()
+        }
+        .generate()
+        .unwrap();
+        for p in &horiz.placements {
+            assert_eq!(p.direction, Direction::E);
+        }
+    }
 
-        let hidden_upper = puzzle.hidden_word.word.to_uppercase();
+    #[test]
+    fn duplicate_is_filtered() {
+        let conf = PuzzleConfig {
+            word_dictionary: words(&["rust", "python", "java"]),
+            solution_dictionary: hidden("rust", "language"),
+            word_count: 2,
+            ..default_config()
+        };
+        let puzzle = conf.generate().unwrap();
+        assert_eq!(puzzle.placements.len(), 2);
+        assert!(!puzzle.words().contains(&"rust"));
 
-        assert!(
-            leftover.starts_with(&hidden_upper),
-            "leftover '{leftover}' does not start with hidden word '{hidden_upper}'"
-        );
+        let conf = PuzzleConfig {
+            word_dictionary: words(&["aba", "aba", "aba"]),
+            solution_dictionary: hidden("zz", "test"),
+            word_count: 1,
+            ..default_config()
+        };
+        let puzzle = conf.generate().unwrap();
+        assert_eq!(puzzle.placements.len(), 1);
+    }
 
-        assert!(
-            leftover.len() < hidden_upper.len() * 2,
-            "leftover is {} chars but hidden word is {} chars (would repeat)",
-            leftover.len(),
-            hidden_upper.len()
-        );
+    #[test]
+    fn rejects_no_solution_words() {
+        let config = PuzzleConfig {
+            word_dictionary: words(&["hello"]),
+            solution_dictionary: vec![],
+            word_count: 1,
+            ..default_config()
+        };
+        assert!(matches!(
+            config.generate(),
+            Err(PuzzleError::NoSolutionWords)
+        ));
+    }
+
+    #[test]
+    fn rejects_empty_word_dictionary() {
+        let config = PuzzleConfig {
+            word_dictionary: vec![],
+            solution_dictionary: hidden("secret", "hidden"),
+            word_count: 1,
+            ..default_config()
+        };
+        assert!(matches!(
+            config.generate(),
+            Err(PuzzleError::EmptyWordDictionary)
+        ));
+    }
+
+    #[test]
+    fn rejects_invalid_word_count() {
+        let config = PuzzleConfig {
+            word_dictionary: words(&["hello"]),
+            solution_dictionary: hidden("secret", "hidden"),
+            word_count: 0,
+            ..default_config()
+        };
+        assert!(matches!(
+            config.generate(),
+            Err(PuzzleError::InvalidWordCount)
+        ));
+    }
+
+    #[test]
+    fn rejects_no_directions() {
+        let config = PuzzleConfig {
+            word_dictionary: words(&["hello"]),
+            solution_dictionary: hidden("secret", "hidden"),
+            word_count: 1,
+            directions: DirectionConfig {
+                horizontally: false,
+                vertically: false,
+                diagonally: false,
+                backward: false,
+            },
+            ..default_config()
+        };
+        assert!(matches!(config.generate(), Err(PuzzleError::NoDirections)));
+    }
+
+    #[test]
+    fn rejects_empty_word() {
+        let config = PuzzleConfig {
+            word_dictionary: words(&["hello"]),
+            solution_dictionary: hidden("", "empty"),
+            word_count: 1,
+            ..default_config()
+        };
+        assert!(matches!(
+            config.generate(),
+            Err(PuzzleError::EmptyWord { .. })
+        ));
+
+        let config = PuzzleConfig {
+            word_dictionary: words(&["hello", ""]),
+            solution_dictionary: hidden("secret", "hidden"),
+            word_count: 1,
+            ..default_config()
+        };
+        assert!(matches!(
+            config.generate(),
+            Err(PuzzleError::EmptyWord { .. })
+        ));
     }
 }

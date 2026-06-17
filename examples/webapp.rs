@@ -1,190 +1,36 @@
-#![allow(dead_code, unused_imports)]
-
-use std::collections::HashSet;
-
-use egui::{Align2, Color32, CornerRadius, FontId, Pos2, Rect, Sense, Vec2};
-use egui_word_search::{Direction, HiddenWord, Puzzle, PuzzleConfig, WordPlacement, generate};
-
-// ── Word lists ──
-
-const WORDS: &[&str] = &[
-    "RUST", "CRAB", "CODE", "MATCH", "CARGO", "STACK", "HEAP", "CLONE", "MACRO", "CRATE", "TRAIT",
-    "ENUM", "IMPL", "DEBUG", "LOGIC", "ERROR", "TOKEN", "SLICE", "GUARD", "LOOP", "MAP", "HASH",
-    "TREE", "GRAPH", "QUEUE", "ARRAY", "BYTE", "TEXT", "NODE", "SCALE",
-];
-
-const HIDDEN_WORDS: &[(&str, &str)] = &[
-    ("PATTERN", "A recurring design structure"),
-    ("COMPILE", "Turn source code into machine code"),
-    ("SYNTAX", "Rules for writing valid code"),
-    ("THREAD", "Lightweight unit of execution"),
-    ("HIDDEN", "Concealed from plain sight"),
-    ("SEARCH", "What you are doing right now"),
-    ("SOLVER", "One who finds solutions"),
-    ("CIPHER", "A secret method of writing"),
-    ("LINKER", "Combines compiled object files"),
-    ("BINARY", "Zeros and ones"),
-];
-
-// ── Difficulty ──
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Difficulty {
-    Easy,
-    Medium,
-    Hard,
-}
-
-impl Difficulty {
-    fn all() -> [Difficulty; 3] {
-        [Difficulty::Easy, Difficulty::Medium, Difficulty::Hard]
-    }
-
-    fn name(&self) -> &'static str {
-        match self {
-            Difficulty::Easy => "Easy",
-            Difficulty::Medium => "Medium",
-            Difficulty::Hard => "Hard",
-        }
-    }
-
-    fn word_count(&self) -> usize {
-        match self {
-            Difficulty::Easy => 6,
-            Difficulty::Medium => 8,
-            Difficulty::Hard => 10,
-        }
-    }
-
-    fn directions(&self) -> Vec<Direction> {
-        match self {
-            Difficulty::Easy => vec![Direction::E, Direction::S],
-            Difficulty::Medium => {
-                vec![Direction::E, Direction::S, Direction::SE, Direction::SW]
-            }
-            Difficulty::Hard => Direction::all().to_vec(),
-        }
-    }
-}
-
-fn build_puzzle_diff(difficulty: Difficulty) -> (PuzzleConfig, Vec<String>) {
-    let hidden_word_list: Vec<HiddenWord> = HIDDEN_WORDS
-        .iter()
-        .map(|&(w, h)| HiddenWord {
-            word: w.to_string(),
-            hint: h.to_string(),
-        })
-        .collect();
-
-    let config = PuzzleConfig {
-        size: None,
-        directions: difficulty.directions(),
-        max_word_attempts: 200,
-        max_grid_attempts: 20,
-        hidden_words: hidden_word_list,
-    };
-
-    let word_count = difficulty.word_count();
-    let words: Vec<String> = WORDS
-        .iter()
-        .take(word_count)
-        .map(|s| s.to_string())
-        .collect();
-
-    (config, words)
-}
-
-// ── Game state ──
-
-struct Game {
-    puzzle: Option<Puzzle>,
-    found_words: HashSet<String>,
-    drag_start: Option<(usize, usize)>,
-    drag_end: Option<(usize, usize)>,
-}
-
-impl Game {
-    fn new() -> Self {
-        Self {
-            puzzle: None,
-            found_words: HashSet::new(),
-            drag_start: None,
-            drag_end: None,
-        }
-    }
-
-    fn new_puzzle(&mut self, config: &PuzzleConfig, words: &[String]) {
-        self.puzzle = Some(generate(words, config).expect("puzzle generation failed"));
-        self.found_words.clear();
-        self.drag_start = None;
-        self.drag_end = None;
-    }
-
-    fn all_visible_found(&self) -> bool {
-        let Some(puzzle) = &self.puzzle else {
-            return false;
-        };
-        puzzle
-            .placements
-            .iter()
-            .all(|p| self.found_words.contains(&p.word.to_uppercase()))
-    }
-}
-
-// ── Helpers ──
-
-fn compute_found_set(puzzle: &Puzzle, found_words: &HashSet<String>) -> HashSet<(usize, usize)> {
-    let mut cells = HashSet::new();
-    for placement in &puzzle.placements {
-        if found_words.contains(&placement.word.to_uppercase()) {
-            let (dr, dc) = placement.direction.delta();
-            for i in 0..placement.word.len() {
-                let r = (placement.row as isize + i as isize * dr) as usize;
-                let c = (placement.col as isize + i as isize * dc) as usize;
-                cells.insert((r, c));
-            }
-        }
-    }
-    cells
-}
-
-fn cells_on_line(
-    start: Option<(usize, usize)>,
-    end: Option<(usize, usize)>,
-) -> Vec<(usize, usize)> {
-    let (Some(start), Some(end)) = (start, end) else {
-        return Vec::new();
-    };
-
-    let dr = (end.0 as isize - start.0 as isize).signum();
-    let dc = (end.1 as isize - start.1 as isize).signum();
-
-    let is_valid = dr == 0 || dc == 0 || dr.abs() == dc.abs();
-    if !is_valid {
-        return Vec::new();
-    }
-
-    let steps = (end.0 as isize - start.0 as isize)
-        .abs()
-        .max((end.1 as isize - start.1 as isize).abs());
-    let mut cells = Vec::new();
-    for i in 0..=steps {
-        let r = (start.0 as isize + i * dr) as usize;
-        let c = (start.1 as isize + i * dc) as usize;
-        cells.push((r, c));
-    }
-    cells
-}
-
-// ── Web application (wasm32 only) ──
-
-#[cfg(target_arch = "wasm32")]
-mod web_app {
-    use super::*;
+// The #[run_example] macro generates:
+//   - wasm32: A #[wasm_bindgen(start)] that calls this function body
+//   - native: a main with `dist` / `start` sub-commands that build the wasm
+//             bundle and serve it via a local dev server
+#[xtask_wasm::run_example]
+fn run() {
     use eframe;
+    use egui::{Align2, Color32, CornerRadius, FontId, Rect, Sense, Vec2};
+    use egui_word_search::WordPlacement;
+    use egui_word_search::{DirectionConfig, HiddenWord, Orientation, Puzzle, PuzzleConfig};
+    use std::collections::HashSet;
     use wasm_bindgen_futures;
     use web_sys;
     use xtask_wasm::wasm_bindgen::JsCast;
+
+    const WORDS: &[&str] = &[
+        "RUST", "CRAB", "CODE", "MATCH", "CARGO", "STACK", "HEAP", "CLONE", "MACRO", "CRATE",
+        "TRAIT", "ENUM", "IMPL", "DEBUG", "LOGIC", "ERROR", "TOKEN", "SLICE", "GUARD", "LOOP",
+        "MAP", "HASH", "TREE", "GRAPH", "QUEUE", "ARRAY", "BYTE", "TEXT", "NODE", "SCALE",
+    ];
+
+    const HIDDEN_WORDS: &[(&str, &str)] = &[
+        ("PATTERN", "A recurring design structure"),
+        ("COMPILE", "Turn source code into machine code"),
+        ("SYNTAX", "Rules for writing valid code"),
+        ("THREAD", "Lightweight unit of execution"),
+        ("HIDDEN", "Concealed from plain sight"),
+        ("SEARCH", "What you are doing right now"),
+        ("SOLVER", "One who finds solutions"),
+        ("CIPHER", "A secret method of writing"),
+        ("LINKER", "Combines compiled object files"),
+        ("BINARY", "Zeros and ones"),
+    ];
 
     struct WordSearchApp {
         game: Game,
@@ -203,8 +49,8 @@ mod web_app {
                 guess_input: String::new(),
                 guess_result: None,
             };
-            let (config, words) = build_puzzle_diff(app.difficulty);
-            app.game.new_puzzle(&config, &words);
+            let config = build_puzzle_config(app.difficulty);
+            app.game.new_puzzle(&config);
             app
         }
     }
@@ -217,8 +63,6 @@ mod web_app {
                 egui::Visuals::light()
             });
 
-            // ── Top panel ──
-
             egui::Panel::top("top").show_inside(ui, |ui| {
                 ui.horizontal(|ui| {
                     ui.menu_button("Settings", |ui| {
@@ -227,8 +71,8 @@ mod web_app {
                             let before = self.difficulty;
                             let resp = ui.radio_value(&mut self.difficulty, diff, diff.name());
                             if resp.clicked() && before != diff {
-                                let (config, words) = build_puzzle_diff(diff);
-                                self.game.new_puzzle(&config, &words);
+                                let config = build_puzzle_config(diff);
+                                self.game.new_puzzle(&config);
                                 self.guess_input.clear();
                                 self.guess_result = None;
                             }
@@ -243,8 +87,8 @@ mod web_app {
                         }
                         ui.separator();
                         if ui.button("New Game").clicked() {
-                            let (config, words) = build_puzzle_diff(self.difficulty);
-                            self.game.new_puzzle(&config, &words);
+                            let config = build_puzzle_config(self.difficulty);
+                            self.game.new_puzzle(&config);
                             self.guess_input.clear();
                             self.guess_result = None;
                         }
@@ -290,8 +134,6 @@ mod web_app {
                 });
             });
 
-            // ── Grid ──
-
             if self.game.all_visible_found() && self.guess_result == Some(true) {
                 ui.vertical_centered(|ui| {
                     ui.add_space(ui.available_height().max(0.0) * 0.3);
@@ -299,8 +141,8 @@ mod web_app {
                     ui.label("You found all the words and cracked the hidden word!");
                     ui.add_space(10.0);
                     if ui.button("New Game").clicked() {
-                        let (config, words) = build_puzzle_diff(self.difficulty);
-                        self.game.new_puzzle(&config, &words);
+                        let config = build_puzzle_config(self.difficulty);
+                        self.game.new_puzzle(&config);
                         self.guess_input.clear();
                         self.guess_result = None;
                     }
@@ -366,8 +208,6 @@ mod web_app {
                         }
                     }
 
-                    // ── Input handling ──
-
                     if response.is_pointer_button_down_on() {
                         if let Some(pos) = ui.ctx().pointer_interact_pos() {
                             let local = pos - origin;
@@ -407,8 +247,6 @@ mod web_app {
                 });
             }
 
-            // ── Bottom panel: word list ──
-
             egui::Panel::bottom("bottom").show_inside(ui, |ui| {
                 if let Some(puzzle) = &self.game.puzzle {
                     ui.label("Words to find:");
@@ -441,60 +279,203 @@ mod web_app {
         }
     }
 
-    pub fn run() {
-        let document = web_sys::window()
-            .expect("no window")
-            .document()
-            .expect("no document");
-
-        let canvas = document
-            .create_element("canvas")
-            .expect("failed to create canvas")
-            .dyn_into::<web_sys::HtmlCanvasElement>()
-            .expect("not a HtmlCanvasElement");
-
-        let style = canvas.style();
-        style
-            .set_property("position", "fixed")
-            .expect("failed to set position property");
-        style
-            .set_property("top", "0")
-            .expect("failed to set top property");
-        style
-            .set_property("left", "0")
-            .expect("failed to set left property");
-        style
-            .set_property("width", "100%")
-            .expect("failed to set width property");
-        style
-            .set_property("height", "100%")
-            .expect("failed to set height property");
-
-        let body = document.body().expect("no body");
-        body.style()
-            .set_property("margin", "0")
-            .expect("failed to set margin property");
-        body.append_child(&canvas).expect("failed to append canvas");
-
-        wasm_bindgen_futures::spawn_local(async move {
-            eframe::WebRunner::new()
-                .start(
-                    canvas,
-                    eframe::WebOptions::default(),
-                    Box::new(|_cc| Ok(Box::new(WordSearchApp::default()))),
-                )
-                .await
-                .expect("failed to start eframe");
-        });
+    struct Game {
+        puzzle: Option<Puzzle>,
+        found_words: HashSet<String>,
+        drag_start: Option<(usize, usize)>,
+        drag_end: Option<(usize, usize)>,
     }
-}
 
-// The #[run_example] macro generates:
-//   - wasm32: A #[wasm_bindgen(start)] that calls this function body
-//   - native: a main with `dist` / `start` sub-commands that build the wasm
-//             bundle and serve it via a local dev server
-#[xtask_wasm::run_example]
-fn run() {
-    #[cfg(target_arch = "wasm32")]
-    web_app::run();
+    impl Game {
+        fn new() -> Self {
+            Self {
+                puzzle: None,
+                found_words: HashSet::new(),
+                drag_start: None,
+                drag_end: None,
+            }
+        }
+
+        fn new_puzzle(&mut self, config: &PuzzleConfig) {
+            self.puzzle = Some(config.generate().expect("puzzle generation failed"));
+            self.found_words.clear();
+            self.drag_start = None;
+            self.drag_end = None;
+        }
+
+        fn all_visible_found(&self) -> bool {
+            let Some(puzzle) = &self.puzzle else {
+                return false;
+            };
+            puzzle
+                .placements
+                .iter()
+                .all(|p| self.found_words.contains(&p.word.to_uppercase()))
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Difficulty {
+        Easy,
+        Medium,
+        Hard,
+    }
+
+    impl Difficulty {
+        fn all() -> [Difficulty; 3] {
+            [Difficulty::Easy, Difficulty::Medium, Difficulty::Hard]
+        }
+
+        fn name(&self) -> &'static str {
+            match self {
+                Difficulty::Easy => "Easy",
+                Difficulty::Medium => "Medium",
+                Difficulty::Hard => "Hard",
+            }
+        }
+
+        fn word_count(&self) -> usize {
+            match self {
+                Difficulty::Easy => 6,
+                Difficulty::Medium => 8,
+                Difficulty::Hard => 10,
+            }
+        }
+
+        fn direction_config(&self) -> DirectionConfig {
+            match self {
+                Difficulty::Easy => DirectionConfig {
+                    horizontally: true,
+                    vertically: true,
+                    diagonally: false,
+                    backward: false,
+                },
+                Difficulty::Medium => DirectionConfig {
+                    horizontally: true,
+                    vertically: true,
+                    diagonally: true,
+                    backward: false,
+                },
+                Difficulty::Hard => DirectionConfig {
+                    horizontally: true,
+                    vertically: true,
+                    diagonally: true,
+                    backward: true,
+                },
+            }
+        }
+    }
+
+    fn build_puzzle_config(difficulty: Difficulty) -> PuzzleConfig {
+        let solution_dictionary: Vec<HiddenWord> = HIDDEN_WORDS
+            .iter()
+            .map(|&(w, h)| HiddenWord {
+                word: w.to_string(),
+                hint: h.to_string(),
+            })
+            .collect();
+
+        let word_dictionary: Vec<String> = WORDS.iter().map(|s| s.to_string()).collect();
+
+        PuzzleConfig {
+            word_dictionary,
+            solution_dictionary,
+            word_count: difficulty.word_count(),
+            orientation: Orientation::Square,
+            directions: difficulty.direction_config(),
+            max_word_attempts: 200,
+            max_grid_attempts: 20,
+        }
+    }
+
+    fn compute_found_set(
+        puzzle: &Puzzle,
+        found_words: &HashSet<String>,
+    ) -> HashSet<(usize, usize)> {
+        let mut cells = HashSet::new();
+        for placement in &puzzle.placements {
+            if found_words.contains(&placement.word.to_uppercase()) {
+                let (dr, dc) = placement.direction.delta();
+                for i in 0..placement.word.len() {
+                    let r = (placement.row as isize + i as isize * dr) as usize;
+                    let c = (placement.col as isize + i as isize * dc) as usize;
+                    cells.insert((r, c));
+                }
+            }
+        }
+        cells
+    }
+
+    fn cells_on_line(
+        start: Option<(usize, usize)>,
+        end: Option<(usize, usize)>,
+    ) -> Vec<(usize, usize)> {
+        let (Some(start), Some(end)) = (start, end) else {
+            return Vec::new();
+        };
+
+        let dr = (end.0 as isize - start.0 as isize).signum();
+        let dc = (end.1 as isize - start.1 as isize).signum();
+
+        let is_valid = dr == 0 || dc == 0 || dr.abs() == dc.abs();
+        if !is_valid {
+            return Vec::new();
+        }
+
+        let steps = (end.0 as isize - start.0 as isize)
+            .abs()
+            .max((end.1 as isize - start.1 as isize).abs());
+        let mut cells = Vec::new();
+        for i in 0..=steps {
+            let r = (start.0 as isize + i * dr) as usize;
+            let c = (start.1 as isize + i * dc) as usize;
+            cells.push((r, c));
+        }
+        cells
+    }
+
+    let document = web_sys::window()
+        .expect("no window")
+        .document()
+        .expect("no document");
+
+    let canvas = document
+        .create_element("canvas")
+        .expect("failed to create canvas")
+        .dyn_into::<web_sys::HtmlCanvasElement>()
+        .expect("not a HtmlCanvasElement");
+
+    let style = canvas.style();
+    style
+        .set_property("position", "fixed")
+        .expect("failed to set position property");
+    style
+        .set_property("top", "0")
+        .expect("failed to set top property");
+    style
+        .set_property("left", "0")
+        .expect("failed to set left property");
+    style
+        .set_property("width", "100%")
+        .expect("failed to set width property");
+    style
+        .set_property("height", "100%")
+        .expect("failed to set height property");
+
+    let body = document.body().expect("no body");
+    body.style()
+        .set_property("margin", "0")
+        .expect("failed to set margin property");
+    body.append_child(&canvas).expect("failed to append canvas");
+
+    wasm_bindgen_futures::spawn_local(async move {
+        eframe::WebRunner::new()
+            .start(
+                canvas,
+                eframe::WebOptions::default(),
+                Box::new(|_cc| Ok(Box::new(WordSearchApp::default()))),
+            )
+            .await
+            .expect("failed to start eframe");
+    });
 }
